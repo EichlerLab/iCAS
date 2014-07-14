@@ -1,0 +1,958 @@
+#!/software/bin/perl
+
+# Copyright (c) 2011-2012, 2014 Genome Research Ltd.
+#
+# Author: Andrew Whitwham <aw7@sanger.ac.uk>
+#
+# This file is part of iCAS.
+#
+# iCAS is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <http://www.gnu.org/licenses/>. 
+
+
+# Illumina Clone Assembly System - a standalone version of clone
+# assembly pipeline used at the Wellcome Trust Sanger Institute.
+
+use strict;
+use warnings;
+
+use Getopt::Long;
+use File::Temp qw(tempdir);
+use File::Spec::Functions qw(rel2abs);
+use File::Basename;
+use Cwd;
+
+use Cwd;
+umask 002;
+my ($prog) = $0 =~ /(?:.*\/)?(.*)$/;
+
+my $VERSION = "0.6.2";
+
+print "ICAS v$VERSION\n";
+
+my %opts;
+$opts{phusion} = 1;
+
+GetOptions(\%opts, 'outdir=s', 'workingdir=s', 'bam=s', 'clone=s', 'screen=s',
+    	    'vector_end!', 'use_number_reads=s', 'fq1=s', 'fq2=s', 'kmer_abyss=s', 'kmer_soap=s',
+	    'mapping=s', 'phusion!', 'insert=s', 'trim=s', 'kmer_copy=s', 'noisy!');
+
+if ((!$opts{bam} && !($opts{fq1} && $opts{fq2})) || !$opts{clone}) {
+    die "Usage: $prog [-outdir dir -workingdir dir -screen file.fa -kmer_abyss num -kmer_soap num -kmer_copy num -use_number_reads num -mapping num -insert insert_size -trim num] [-bam file | -fq1 file -fq2 file] -clone clone_name\n";
+}
+
+# we use an unfortunately numerous amount of programs, lets check that
+# they are reachable before we go any further
+
+my %sw = (
+    samtools            => 'samtools',
+    ssaha_reads         => 'ssaha_reads',
+    smalt               => 'smalt',
+    get_seqreads        => 'get_seqreads',
+    ssaha_merge         => 'ssaha_merge',
+    trim_fastq          => 'trim_fastq',
+    phusion2            => 'phusion2',
+    SOAPdenovo_63mer    => 'SOAPdenovo-63mer',
+    SOAPdenovo_31mer    => 'SOAPdenovo-31mer',
+    GapCloser           => 'GapCloser',
+    convert_fastq       => 'convert_fastq',
+    fastq2fasta         => 'fastq2fasta',
+    abyss_pe            => 'abyss-pe',
+    cross_genome        => 'cross_genome',
+    parse_cross_genome  => 'parse_cross_genome',
+    get_excreads        => 'get_excreads',
+    map_screen_pcg      => 'map_screen_pcg',
+    map_screen2_pcg     => 'map_screen2_pcg',
+    merge_pcg           => 'merge_pcg',
+    screen_get_seqreads => 'screen_get_seqreads',
+    merge_get_seqreads  => 'merge_get_seqreads',
+    rename_fastq        => 'rename_fastq',
+    tg_index            => 'tg_index',
+    gap5_consensus      => 'gap5_consensus',
+    pop_bubbles         => 'PopBubbles',
+);
+
+my $err = 0;
+
+print "Checking programs ...\n";
+
+$ENV{PATH} = dirname(rel2abs($0)).':'.$ENV{PATH};
+
+for my $program (keys %sw) {
+    if (system("which $sw{$program}")) {
+    	# make an exception for samtools if no bam file used
+	if (($sw{$program} eq  'samtools') && !$opts{bam}) {next;}
+	
+	if ($sw{$program} eq  'smalt') {
+	    # try with alternate smalt name
+	    if (system('which smalt_x86_64') == 0) {
+	    	$sw{$program} = 'smalt_x86_64';
+		next;
+	    }
+	}
+    
+    	print STDERR "Cannot find $sw{$program}\n";
+    	$err = 1;
+    }
+}
+
+if ($err) {
+    die "Error: Unable to find all the programs $prog needs to run.\n";
+}
+
+print "\tdone.\n";
+
+# now to create our working and output directories
+
+my $outdir = '.';
+
+if ($opts{outdir}) {
+    $outdir = rel2abs($opts{outdir});
+    system "mkdir -p $outdir";
+}
+
+my $wdir;
+
+if ($opts{workingdir}) {
+    $wdir = rel2abs($opts{workingdir});
+    system "mkdir -p $wdir";
+} else {
+    $wdir = tempdir(CLEANUP => 1);
+}
+    
+if ($opts{screen}) {
+    # with the changing of directories, absolute file paths are useful
+    $opts{screen} = rel2abs($opts{screen});
+}
+
+if ($opts{bam}) {
+    # with the changing of directories, absolute file paths are useful
+    $opts{bam} = rel2abs($opts{bam});
+}
+
+if ($opts{fq1}) {
+    # with the changing of directories, absolute file paths are useful
+    $opts{fq1} = rel2abs($opts{fq1});
+}
+
+if ($opts{fq2}) {
+    # with the changing of directories, absolute file paths are useful
+    $opts{fq2} = rel2abs($opts{fq2});
+}
+
+# below are some artifacts of the Sanger's Illumina Clone Assembly pipeline
+# that the other programs need to run.  There is no inherent meaning to these
+# names and numbers
+
+my $run     = 1234;
+my $lane    = 5;
+my $tag     = 6;
+my $prefix  = 'tagreads_';
+my $tagname = "$prefix".sprintf("%04d", $tag);
+my $file    = "$tagname.fastq";
+
+# now to make the fastq files
+
+if ($opts{bam}) {
+    print "Making fastq from file $opts{bam} ...\n";
+
+    bam2fastq(\%sw, \%opts, $wdir, $run, $lane, $tag);
+
+    print "\tdone.\n";
+} else {
+    # put a link to the fastq files into the working directory
+    my $cmd = "ln -s $opts{fq1} $wdir/${run}_${lane}_${tag}_1.fastq";
+    system($cmd) == 0 or die "Error running $cmd\n";
+    
+    $cmd = "ln -s $opts{fq2} $wdir/${run}_${lane}_${tag}_2.fastq";
+    system($cmd) == 0 or die "Error running $cmd\n";
+}    
+    
+
+# see if we need to reduce the number of reads
+if ($opts{use_number_reads}) {
+    my $number_reads = $opts{use_number_reads};
+    
+    if (($number_reads !~ /^\d+$/) || ($number_reads < 1)) {
+    	die "Error: number of reads needs to be a positive number. Number found $number_reads\n";
+    }
+    
+    $number_reads *= 4; # each fastq read is 4 lines in our input files
+    
+    my $cmd = "head -n $number_reads $wdir/${run}_${lane}_${tag}_1.fastq > $wdir/${tagname}_s_1.fastq";
+    system($cmd) == 0 or die "Error running $cmd\n";
+    
+    $cmd = "head -n $number_reads $wdir/${run}_${lane}_${tag}_2.fastq > $wdir/${tagname}_s_2.fastq";
+    system($cmd) == 0 or die "Error running $cmd\n";
+} else {
+    # use all the reads, simple link to mimic this
+    
+    my $cmd = "ln -s $wdir/${run}_${lane}_${tag}_1.fastq $wdir/${tagname}_s_1.fastq";
+    system($cmd) == 0 or die "Error running $cmd\n";
+    
+    $cmd = "ln -s $wdir/${run}_${lane}_${tag}_2.fastq $wdir/${tagname}_s_2.fastq";
+    system($cmd) == 0 or die "Error running $cmd\n";
+}
+
+# a lot of the programs want to run where the data is so change directories
+my $orig_dir = getcwd();
+chdir $wdir;
+
+# put in an eval to help tempfile clean up after itself
+eval {
+    # screen out unwanted reads; vector and e.coli being favourites
+
+    if ($opts{screen}) {
+	$opts{screen} = rel2abs($opts{screen}); 
+	screen(\%sw, \%opts, $wdir, $tagname, $opts{screen});
+    } else {
+	# we need one fastq file
+	simple_merge(\%sw, $wdir, $tagname);
+    }
+
+    # now time to do the assembly
+    assemble(\%sw, \%opts, $wdir, $tagname);
+
+    # map the reads back to consensus and use gap5 to refine it
+    align_reads(\%sw, \%opts, $wdir, $tagname);
+};
+
+if ($@) {
+    # we hit an error, time to die
+    chdir $orig_dir;
+    die; # propagate error
+}
+
+chdir $orig_dir;
+
+# now copy the files to there end place
+my @suff = ("0.g5d", "0.g5x", "contig.fasta");
+
+for my $end (@suff) {
+    if (-e "$wdir/$tagname.$end") {
+    	print "cp $wdir/$tagname.$end $outdir/$opts{clone}.$end\n";
+	system "cp $wdir/$tagname.$end $outdir/$opts{clone}.$end";
+    }
+}
+
+print "\nAll done.\n";
+
+exit;
+
+# functions go here
+
+# use samtools to convert bam files into paired fastq files
+sub bam2fastq {
+    my ($exe, $opt, $wd, $run, $lane, $tag) = @_;
+    
+    if (!(-e $opt->{bam})) {
+    	die "Error: Can't find file $opt->{bam}\n";
+    }
+    
+    my $pipe1 = "$wd/$opt->{clone}_tmp_pipe1";
+    my $pipe2 = "$wd/$opt->{clone}_tmp_pipe2";
+    
+    system "mkfifo $pipe1.bam";
+    system "mkfifo $pipe2.bam";
+    
+    my $cmd = "$exe->{samtools} sort -n $opt->{bam} $pipe2 & $exe->{samtools} view $pipe2.bam";
+    
+    open my $ph, '-|', $cmd or die "Can't open pipe to $cmd"; 
+    
+    open my $out1, ">$wd/${run}_${lane}_${tag}_1.fastq" or die "Can't write to $wd/${run}_${lane}_${tag}_1.fastq";
+    open my $out2, ">$wd/${run}_${lane}_${tag}_2.fastq" or die "Can't write to $wd/${run}_${lane}_${tag}_2.fastq";
+    
+    while ((my $inline = <$ph>)) {
+
+	if ($inline =~ /(\S+)\t(\d+)\t(\S+\t){7}(\w+)\t(\S+)/) {
+    	    my $name = $1;
+	    my $flag = $2;
+	    my $read = $4;
+	    my $qual = $5;
+
+	    if ($flag & 16) {
+		$read =~ tr/ACTGactg/TGACtgac/;
+		$read = reverse $read;
+		$qual = reverse $qual;
+	    }
+
+    	    if (($flag & 128)) {
+		print $out2 "\@$name/2\n$read\n+\n$qual\n";
+	    } else {
+		print $out1 "\@$name/1\n$read\n+\n$qual\n";
+	    } 
+	} else {
+    	    print STDERR "Can't parse line $inline\n";
+	}
+    }
+
+    close $ph or die "Can't run command $cmd";
+    close $out1;
+    close $out2;
+    
+    system "rm $pipe1.bam";
+    system "rm $pipe2.bam";
+}
+    
+
+# screen the fastq files contamination, produces screened paired fastq files
+# and a single merged files used in some of the later programs
+sub screen {
+    my ($exe, $opt, $wd, $tag_name, $screen) = @_;
+    
+    if (!(-e $screen)) {
+    	die "Error: can't find file $screen\n";
+    }
+    
+    print "Screening reads for contaminants.\n";
+    
+    # make a vector hash file
+    my $cmd = "$exe->{smalt} index -k 20 -s 13 hash_vector $screen";
+    system($cmd) == 0 or die "Error running $cmd";
+
+    # find contaminants
+    $cmd = "$exe->{smalt} map -i 900 -j 40 hash_vector ${tag_name}_s_1.fastq  ${tag_name}_s_2.fastq > $tag_name.out";
+    system($cmd) == 0 or die "Error running $cmd";
+
+    # grab the cigar strings
+    $cmd = "egrep cigar: $tag_name.out > $tag_name.cigar";
+    system($cmd) == 0 or die "Error running $cmd";
+    
+    # separate names
+    open my $inf, "$tag_name.cigar" or die "Can't open $tag_name.cigar";
+    open my $out1, ">${tag_name}_1.name" or die "Can't open ${tag_name}_1.name for writing";
+    open my $out2, ">${tag_name}_2.name" or die "Can't open ${tag_name}_2.name for writing";
+
+     while ((my $inline = <$inf>)) {
+	my $inline2 = <$inf>;
+
+	my $pass1;
+	my $pass2;
+
+	if (($inline =~ /^cigar:N/ || $inline =~ /^cigar:A/) && $inline !~ /ecoli/) {
+
+    	    if ($inline =~/^cigar:A/) {
+		if ($inline =~ /\+\s(\d+)\sM/ && $1 < 80 && $opt->{vector_end}) {
+	    	    $pass1 = 1;
+		}
+	    } else {
+		$pass1 = 1;
+	    }
+	}
+
+	if (($inline2 =~ /^cigar:N/ || $inline2 =~ /^cigar:A/) && $inline2 !~ /ecoli/) {
+
+    	    if ($inline2 =~/^cigar:A/) {
+		if ($inline2 =~ /\+\s(\d+)\sM/ && $1 < 80 && $opt->{vector_end}) {
+	    	    $pass2 = 1;
+		}
+	    } else {
+		$pass2 = 1;
+	    }
+	}
+
+	if ($pass1 && $pass2) {
+    	    my @entries = split ' ', $inline;
+    	    my $name = $entries[1];
+	    print $out1 $name."\n";
+
+    	    @entries = split ' ', $inline2;
+    	    $name = $entries[1];
+	    print $out2 $name."\n";
+	}
+    }
+
+    close $inf;
+    close $out1;
+    close $out2;
+   
+    # get the reads we need
+    $cmd = "$exe->{get_seqreads} ${tag_name}_1.name ${tag_name}_s_1.fastq ${tag_name}-screen_1.fastq";
+    system($cmd) == 0 or die "Error running $cmd";
+    $cmd = "$exe->{get_seqreads} ${tag_name}_2.name ${tag_name}_s_2.fastq ${tag_name}-screen_2.fastq";
+    system($cmd) == 0 or die "Error running $cmd";
+    
+    print "Merging fastq files.\n";
+
+    # and merge them back together
+    $cmd = "$exe->{ssaha_merge} -file 2 ${tag_name}-screen_1.fastq ${tag_name}-screen_2.fastq $tag_name.fastq";
+    system($cmd) == 0 or die "Error running $cmd";
+}
+
+
+# if not using screening, merge the paired fastq files into a single
+# file for later use
+sub simple_merge {
+    my ($exe, $wd, $tag_name, $screen) = @_;
+    
+    print "Merging fastq files.\n";
+    
+    # merge them together
+    my $cmd = "$exe->{ssaha_merge} -file 2 ${tag_name}_s_1.fastq ${tag_name}_s_2.fastq $tag_name.fastq";
+    system($cmd) == 0 or die "Error running $cmd";
+}
+
+
+# the assembly stage that should end with contigs in fasta format,
+# details at the end of this file
+sub assemble {
+    my ($exe, $opt, $wd, $tag_name) = @_;
+    
+    my $cmd;
+    
+    #set up some file names
+    my $screened1 = "${tagname}_trim_screen.fq1";
+    my $screened2 = "${tagname}_trim_screen.fq2";
+    
+    my $unscreened1 = "${tagname}_trim1.fastq";
+    my $unscreened2 = "${tagname}_trim2.fastq";
+   
+    if ($opt->{phusion}) {
+	# get a trimmed fastq file
+	print "Making trimmed fastq file.\n";
+	
+	my $trim = 72;
+	
+	if ($opt->{trim}) {
+	    $trim = $opt->{trim};
+	}
+
+	$cmd = "$exe->{trim_fastq} $trim $tag_name.fastq ${tagname}_trim.fq";
+	system($cmd) == 0 or die "Error running $cmd";
+
+	# screen with phusion
+	print "Screening with phusion.\n";
+
+	$cmd = "$exe->{phusion2} hash -kmer 31 ${tagname}_trim.fq > /dev/null";
+	system($cmd) == 0 or die "Error running $cmd";
+
+	$cmd = "$exe->{phusion2} sort -kmer 31 ${tagname}_trim.fq > /dev/null";
+	system($cmd) == 0 or die "Error running $cmd";
+	
+	my $copy = 0;
+	
+	if ($opt->{kmer_copy}) {
+	    $copy = $opt->{kmer_copy};
+	}
+
+	$cmd = "$exe->{phusion2} screen -uniq 0 -copy $copy -kmer 31 ${tagname}_trim.fq > /dev/null";
+	system($cmd) == 0 or die "Error running $cmd";
+
+	$cmd = "$exe->{ssaha_reads} -file 22 ${tagname}_trim.fq.screen  $screened1 $screened2 > /dev/null";
+	system($cmd) == 0 or die "Error running $cmd";
+
+	$cmd = "$exe->{ssaha_reads} -file 22 ${tagname}_trim.fq $unscreened1 $unscreened2 > /dev/null";
+	system($cmd) == 0 or die "Error running $cmd";
+
+    } else {
+    	# just fake it
+	$cmd = "ln -s $wdir/${tagname}_s_1.fastq $wdir/$screened1";
+	system($cmd) == 0 or die "Error running $cmd\n";
+
+	$cmd = "ln -s $wdir/${tagname}_s_2.fastq $wdir/$screened2";
+	system($cmd) == 0 or die "Error running $cmd\n";
+
+	$cmd = "ln -s $wdir/${tagname}_s_1.fastq $wdir/$unscreened1";
+	system($cmd) == 0 or die "Error running $cmd\n";
+
+	$cmd = "ln -s $wdir/${tagname}_s_2.fastq $wdir/$unscreened2";
+	system($cmd) == 0 or die "Error running $cmd\n";
+    }
+
+    # set up some variables
+    my $insert = 300;
+    
+    if ($opt->{insert}) {
+    	$insert = $opt->{insert};
+    }
+    
+    my @abyss_kmers = (61, 53, 45, 31, 21); # alternate kmer values
+    my @soap_kmers  = (61, 53, 45, 31, 21);
+    
+    # use set values if provided
+    if ($opt->{kmer_abyss}) {
+    	@abyss_kmers = ($opt->{kmer_abyss});
+    }
+    
+    if ($opt->{kmer_soap}) {
+    	@soap_kmers = ($opt->{kmer_soap});
+    }
+
+    my $ai = 0;
+    my $aleng = scalar @abyss_kmers;
+
+    my $si = 0;
+    my $sleng = scalar @soap_kmers;
+
+    my $merge_succeed = 0;
+    my $soap_succeed  = 0;
+    my $abyss_succeed = 0;
+    
+    while ($ai < $aleng && $si < $sleng) {
+    	print "Trying assemblers with SOAPdenovo kmer=$soap_kmers[$si] ABySS kmer=$abyss_kmers[$ai]\n";
+
+	if (!$soap_succeed) {
+    	    if (!soap_assemble($exe, $soap_kmers[$si], $insert, $screened1, $screened2, 'soap_contigs.fasta', $opt->{noisy})) {
+		print "SOAPdenovo failed with kmer ".$soap_kmers[$si]."\n";
+		$si++;
+		next;
+	    } else {
+		$soap_succeed = 1;
+	    }
+	}
+
+	if (!$abyss_succeed) {
+    	    if (!abyss_assemble($exe, $abyss_kmers[$ai], $insert, $unscreened1, $unscreened2, 'abyss_contigs.fasta', $opt->{noisy})) {
+		print "Abyss failed with kmer ".$abyss_kmers[$ai]."\n";
+		$ai++;
+		next;
+	    } else {
+		$abyss_succeed = 1;
+	    }
+	}
+
+	if (run_command("$exe->{cross_genome} soap_contigs.fasta abyss_contigs.fasta -seeds 20 -score 200 | egrep ALIGN | egrep -v egrep > align.dat", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{map_screen_pcg} align.dat | egrep ALIGN | egrep -v egrep > align-clean.dat", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{map_screen2_pcg} align-clean.dat | egrep ALIGN | egrep -v egrep > align-clean2.dat", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{merge_pcg} align-clean2.dat | egrep merge- > merge.dat", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{screen_get_seqreads} merge.dat soap_contigs.fasta abyss_contigs.fasta merge-clean.dat > /dev/null", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{merge_get_seqreads} merge-clean.dat soap_contigs.fasta abyss_contigs.fasta merge2.fastq > /dev/null", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{rename_fastq} -name contig -len 200 merge2.fastq merge.fastq > /dev/null", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	if (run_command("$exe->{fastq2fasta} merge.fastq merge.fasta > /dev/null", \$ai, \$si, \$abyss_succeed, \$soap_succeed)) {
+	    next;
+	}
+
+	# if we have a merge.fasta file then the assembly and merge worked
+	if (-e "merge.fasta") {
+    	    $merge_succeed = 1;
+	    last;
+	}
+    }
+    
+    if (!$merge_succeed) {
+	die "Unable to create merged consensus ";
+    } else {
+	print "Aligned with Soap kmer $soap_kmers[$si] and Abyss kmer $abyss_kmers[$ai]\n";
+    }
+}
+
+   
+sub run_command {
+    my ($command, $a, $s, $as, $ss) = @_;
+    
+    if (system($command) != 0) {
+	warn "Error running $command";
+	
+	print "Retry with lower kmer values\n";
+	
+	$$a++; $$s++;
+	
+	$$ss = 0;
+	$$as = 0;
+	
+	return 1;
+    } else {
+    	return 0;
+    }
+}
+
+   
+sub soap_assemble {
+    my ($exe, $kmer, $insert, $in_file1, $in_file2, $out_file, $noisy) = @_;
+    
+    # clear away any old working files
+    while (glob "k*\.*") {
+    	unlink $_;
+    }
+    
+    print "Running SOAPdenovo with kmer = $kmer\n";  
+
+    # soap needs a config file
+    my $config = 'soap_config';
+    
+    open my $fh, ">$config" or die "Can't open $config for writing";
+    
+    print $fh "#maximal read length\nmax_rd_len=120\n[LIB]\navg_ins=$insert\n";
+    print $fh "reverse_seq=0\nasm_flags=3\nrank=1\npair_num_cutoff=3\nmap_len=32\n";
+    print $fh "q1=$in_file1\nq2=$in_file2\n";
+    
+    close $fh;
+    
+    my $op = " > /dev/null";
+    
+    if ($noisy) {
+    	$op = "";
+    }
+    
+    my $run = " all -s $config -K $kmer -o k$kmer -p 1".$op;
+    
+    if ($kmer >= 32) {
+    	$run = "$exe->{SOAPdenovo_63mer}".$run;
+    } else {
+    	$run = "$exe->{SOAPdenovo_31mer}".$run;
+    }
+    
+    if (system($run) != 0) {
+    	warn "Error running $run";
+	return 0;
+    }
+    
+    $run = "$exe->{GapCloser} -o k$kmer.gf1 -b $config -a k$kmer.scafSeq".$op;
+    system $run;
+    
+    $run = "$exe->{GapCloser} -o k$kmer.gf -b $config -a k$kmer.gf1".$op;
+    system $run;
+    
+    $run = "$exe->{convert_fastq} k$kmer.gf k${kmer}-super.fastq".$op;
+    
+    if (system($run) != 0) {
+    	warn "Error running $run";
+	return 0;
+    }
+    
+    $run = "$exe->{fastq2fasta} k${kmer}-super.fastq $out_file".$op;
+    system $run;
+    
+    print "SOAPdenovo assembly succeeded with kmer = $kmer\n";
+    
+    return 1;
+}
+    
+    
+sub abyss_assemble {
+    my ($exe, $kmer, $insert, $in_file1, $in_file2, $out_file, $noisy) = @_;
+    
+    # clear away any old working files
+    while (glob "abyss_assembly*") {
+    	unlink $_;
+    }  
+
+    print "Running ABySS with kmer = $kmer\n";  
+
+    # different version of Abyss have different commands 
+    my $use_new = 1;
+
+    my $run = "$exe->{pop_bubbles} --version";
+
+    open my $pb, '-|', $run or warn "Can't run $run\n";
+
+    while (<$pb>) {
+	if (/PopBubbles \(ABySS\)\s+(\d+)\.(\d+)\.(\d*)/) {
+	    if ($1 == 1 && $2 < 3) {
+		$use_new = 0;
+	    }
+	}
+    }
+
+    close $pb or warn "Can't run $run\n";
+
+    my $op = " > /dev/null";
+    
+    if ($noisy) {
+    	$op = "";
+    }
+    
+    if ($use_new) {
+	# ABySS 1.3.3+
+	$run = "$exe->{abyss_pe} contigs k=$kmer n=10 in='$in_file1 $in_file2' name=abyss_assembly".$op; 
+    } else {
+	# pre ABySS 1.3.3
+	$run = "$exe->{abyss_pe} k=$kmer n=10 in='$in_file1 $in_file2' name=abyss_assembly".$op;
+    }
+    
+    if (system($run) != 0) {
+    	warn "Error running $run";
+	return 0;
+    }
+    
+    # start tidying up the abyss output
+    
+    $run = "$exe->{cross_genome} abyss_assembly-contigs.fa abyss_assembly-contigs.fa > match.out";
+    
+    if (system($run) != 0) {
+    	warn "Error running $run";
+	return 0;
+    }
+    
+    $run = "egrep ALIGNM match.out > match.dat";
+    system $run;
+
+    $run = "$exe->{parse_cross_genome} match.dat name.dat".$op;
+
+    if (system($run) != 0) {
+    	warn "Error running $run";
+	return 0;
+    }
+    
+    $run = "$exe->{get_excreads} name.dat abyss_assembly-contigs.fa abyss.fastq".$op;
+
+    if (system($run) != 0) {
+    	warn "Error running $run";
+	return 0;
+    }
+      
+    $run = "$exe->{fastq2fasta} abyss.fastq $out_file";
+    system $run;
+    
+    print "ABySS assembly succeeded with kmer = $kmer\n";
+
+    return 1;
+}
+    
+
+# align the reads back to the consensus. this will give us our gap5 files
+sub align_reads {
+    my ($exe, $opt, $wd, $tag_name) = @_;
+    
+    my $contigs = 'merge.fasta';
+    
+    print "Aligning reads back to consensus.\n";
+    
+    my $cmd = "$exe->{smalt} index -k 13 -s 6 $wd/igc_hash_clone $contigs";
+    system($cmd) == 0 or die "Error running $cmd";
+    
+    my $mapping = '-m 45';
+    
+    if (defined $opt->{mapping}) {
+    	if ($opt->{mapping} == 0) {
+	    $mapping = ' ';
+	} else {
+	    $mapping = "-m ".$opt->{mapping};
+	}
+    }
+    
+    $cmd = "$exe->{smalt} map -r 568 -i 800 -j 20 ".$mapping." -f samsoft -o $wd/igc_smalt.sam $wd/igc_hash_clone ${tag_name}_s_1.fastq ${tag_name}_s_2.fastq";
+    system($cmd) == 0 or die "Error running $cmd";
+
+    
+    # clean out any headers produced by smalt (they just get in the way)
+    open my $iss, "igc_smalt.sam" or die "Can't open igc_smalt.sam";
+    open my $oss, ">igc_unsorted.sam" or die "Can't write to igc_unsorted.sam";
+
+    while (<$iss>) {
+        if (!/^@/) {
+            print $oss $_;
+        }
+    }
+
+    close $iss;
+    close $oss;
+
+    print "Making SAM header.\n";
+
+    open my $inf, "$contigs" or die "Can't open $contigs";
+    open my $out, ">$wd/igc_header.txt" or die "Can't write to $wd/igc_header.txt";
+
+    my $length = 0;
+    my $name;
+
+    while (<$inf>) {
+	chomp;
+
+	if (/>(.+)/) {
+    	    if ($length) {
+		print $out "\tLN:$length\n";
+		$length = 0;
+	    }
+
+    	    print $out "\@SQ\tSN:$1"
+	} else {
+    	    $length += length;
+	}
+    }
+
+    close $inf;
+
+    if ($length) {
+	print $out "\tLN:$length\n";
+    }
+
+    print $out "\@SQ\tSN:*\tLN:0\n";
+
+    close $out;
+    
+    print "Sorting SAM file.\n";
+    
+    $cmd = "sort -k 3,3 -k4,4n $wd/igc_unsorted.sam > $wd/igc_sorted.sam";
+    system("$cmd") == 0 or die "Error running $cmd";
+    
+    $cmd = "cat $wd/igc_header.txt $wd/igc_sorted.sam > $wd/igc_finished.sam";
+    system("$cmd") == 0 or die "Error running $cmd";
+    
+    print "Making gap5 files.\n";
+
+    # make a gap5 db
+    $cmd = "$exe->{tg_index} -o $wd/$tag_name.0 $wd/igc_finished.sam";
+    system($cmd) == 0 or die "Error running $cmd\n";
+    
+    print "Get new consensus.\n";
+
+    # extract a consensus from gap5
+    $cmd = "$exe->{gap5_consensus} -strip_pads -format fasta -out $tag_name.contig.fasta $wd/$tag_name.0.g5d";
+    system($cmd) == 0 or die "Error running $cmd\n";
+}
+
+__END__
+
+=head1 NAME
+
+icas - Illumina Clone Assembly System
+
+=head1 SYNOPSIS
+
+icas [-outdir dir -workingdir dir -screen file.fa -kmer_abyss num 
+      -kmer_soap num -use_number_reads num -mapping num -insert num] 
+     [-bam file | -fq1 file -fq2 file]
+	-clone clone_name
+	
+=head1 DESCRIPTION
+
+This is a standalone version of the Illumina Clone Assembly Pipeline used
+at the Wellcome Trust Sanger Institute.
+
+The aim of the pipeline is to assemble tagged clones sequenced by the Illumina
+machines.  These de novo assemblies are intended to be either manually finished
+or at least be of good enough quality for draft submission.
+
+This program replicates the assembly stage of the pipeline without being 
+dependent on the Sanger Institute's infrastructure.
+
+The input for icas are paired Illumina reads, either from a single BAM file or
+two fastq files.
+
+The main assembly work is done by SOAPdenovo and ABySS with SMALT handling
+alignment and gap5 (of the Staden Package) calling the final consensus.
+
+Output is the contig(s) in fasta format and gap5 files for the alignments.    
+
+Basic usage is:
+
+icas -fq1 infile_1.fq -fq2 infile_2.fq -c clonename
+
+Though it is strongly advised to use the -s option to screen for contaminants.
+
+=head1 OPTIONS
+
+=over 4
+
+=item -bam <file.bam>
+
+Input from a BAM file.  Samtools is required for this to work.
+
+=item -fq1 <file_1.fq>
+
+Input from a fastq file.  One part of a pair.
+
+=item -fq2 <file_2.fq>
+
+Input from a fastq file.  The other part of the pair.
+
+=item -clone <name>
+
+Used to give the final output a meaningful name.
+
+=item -screen <contam.fasta>
+
+Screen for contaminents using the reads in <contam.fasta>.  At a minimum you 
+should include the cloning vector in this.  Screening out E.coli can also
+be beneficial.
+
+=item -kmer_abyss <num>
+
+Choose the kmer value for the ABySS assembler.  By default it starts at 63 then
+if that fails steps down through 53, 45, 31 and 21.  Setting a value prevents
+the automatic stepping down.
+
+=item -kmer_soap <num>
+
+Choose the kmer value for the SOAPdenovo assembler.  Works exactly like
+-kmer_abyss above.
+
+=item -kmer_copy <num>
+
+The number of kmer copies allowed through kmer screening.  The lower the number
+the more strict the screening and the less reads are allowed through.
+Suggested values: 0 for very strict, 10000 for more leniency.  Default is 0.  
+
+=item -use_number_reads <num>
+
+Limit the number of reads used to <num> pairs.  There can be an excessive
+number of reads produced by the sequencer and reducing the number used for 
+assembly can make a better result.
+
+=item -outdir <dir>
+
+Write results to specified directory.  Default is to use the current directory.
+
+=item -workingdir <dir>
+
+Instead of using a temp directory put all intermediate files in this directory.
+Unlike the temp directory this one does not get deleted after the script exits.
+
+=item -vector_end
+
+Include reads that contain some (but not all) vector.  Can be useful in some
+finishing operations.  This option assumes that the only thing in the screen
+fasta file is vector and E.coli (marked as ecoli).
+
+=item -mapping <num>
+
+Set the minimum mapping score for the aligner.  Default is 45 and 0 is no
+minimum.
+
+=item -phusion
+
+Use phusion to screen out poor reads.  On by default but turning off can be 
+useful in some cases. Use -nophusion to turn off.
+
+=item -insert <num>
+
+Set the insert size for SOAPdenovo.  Default is 300.
+
+=item -trim <num>
+
+Set the read trim length.  Default is 72.
+
+=item -noisy
+
+Both assemblers produce a great deal of output printed to the screen while they
+are running and is normally hidden.  This option allows the output.   
+
+=back
+
+=head1 AUTHOR
+
+Andrew Whitwham (aw7@sanger.ac.uk)
+
+=cut 

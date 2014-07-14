@@ -1,0 +1,241 @@
+Illumina Clone Assembly System v 0.6.2
+------------------------------------------
+
+This is the standalone version of the Illumina Clone Assembly pipeline used
+at the Sanger Institute.  It was developed to perform de novo assemblies on
+relatively short (30 - 100k bps) clones sequenced by Illumina machines.
+
+
+Installation
+------------
+
+There are two ways of installing icas.
+
+1) The Easy Way
+
+There are two different installation scripts.
+
+a) Download ftp://ftp.sanger.ac.uk/pub/badger/aw7/installicas061.sh and
+run the script.
+
+This will install icas and its associated programs to a directory called
+icas under the current directory.  It will also handle the configuration.
+
+This version will install the latest versions of Smalt, ABySS, SOAPdenovo
+and the Staden Package available at the time of writing.
+
+b) This version will install a duplicate of all the programs used in the
+icas paper.
+
+Download ftp://ftp.sanger.ac.uk/pub/badger/aw7/installicas061_auth.sh and
+run the script.
+
+This uses older versions of Smalt, ABySS, SOAPdenovo and the Staden Package.
+This should be used to replicate the results used in the paper.  It is also
+the version that has had the most testing.  
+
+
+2) The Manual Way
+
+Download ftp://ftp.sanger.ac.uk/pub/badger/aw7/icas_v061.tar.bz2 and unzip and
+untar the file.
+
+After untarring cd into the top level of the newly created directories.
+
+Type:
+
+cd icas
+cd src
+make
+cd -
+perl Makefile.PL
+make
+make install
+
+This will install the programs in /usr/local/bin.
+
+If local installation directory is required add a prefix to the perl
+command. e.g.
+
+perl Makefile.PL PREFIX=~/myprogs/bin
+
+
+Unfortunately icas relies on a number of other programs to work.  For manual
+installation you will also require the following.
+
+Required programs
+-----------------
+
+The versions are the ones that were last tested.
+Later versions should also work. 
+
+SMALT 0.6.3
+www.sanger.ac.uk/resources/software/smalt/
+
+SOAPdenovo 1.05 and GapCloser 1.12
+(Needs SOAPdenovo-31mer and SOAPdenovo-63mer)
+soap.genomics.org.cn/soapdenovo.html
+
+Abyss 1.3.4
+www.bcgsc.ca/platform/bioinfo/software/abyss/releases/1.3.4
+
+Staden Package v9
+sourceforge.net/projects/staden/
+
+Optional programs
+-----------------
+
+SAMtools 0.1.18 (if BAM files are being used)
+samtools.sourceforge.net/
+
+
+Usage
+-----
+icas [-outdir dir -workingdir dir -screen file.fa -kmer_abyss num
+      -kmer_soap num -use_number_reads num -mapping num -insert num]
+      [-bam file | -fq1 file -fq2 file] -clone clone_name
+
+
+The most basic usage is:
+
+icas -fq1 infile_1.fq -fq2 infile_2.fq -c clonename
+
+where infile_1.fq and infile_2.fq are paired reads in fastq format and
+clonename is the prefix we want to give the output files.
+
+To get better results use the -s option to supply a fasta file containing
+contaminants that we want to screen for.  At the very least any vector
+should be screened out.
+
+Another useful option is -o to specify the output directory.  The -u option
+can be used to limit the number of read pairs used and that can give better
+results if using all the reads would result in an assembly of excessive
+depth.
+
+The output is the contig(s) in fasta format and the two Gap5 files.  Gap5
+can be used for viewing the data and exporting the alignments in various
+formats.
+
+
+Options
+-------
+
+-bam <file> (or -b <file>)
+    Input from a BAM file.  Samtools is required for this to work.
+
+-fq1 <file>
+    Input from a fastq file.  One part of a pair.
+
+-fq2 <file>
+    Input from a fastq file.  The other part of the pair.
+
+-clone <name> (or -c <name>)
+    Used to give the final output a meaningful name.
+
+-screen <file> (-s <file>)  
+    Screen for contaminents using the reads in <contam.fasta>.  At a
+    minimum you should include the cloning vector in this.  Screening
+    out E.coli can also be beneficial.
+
+-kmer_abyss <num>
+    Choose the kmer value for the ABySS assembler.  By default it
+    starts at 63 then if that fails steps down through 53, 45, 31 and
+    21.  Setting a value prevents the automatic stepping down.
+
+-kmer_soap <num>
+    Choose the kmer value for the SOAPdenovo assembler.  Works exactly
+    like -kmer_abyss above.
+
+-kmer_copy <num>
+    The number of kmer copies allowed through kmer screening.  The lower the number
+    the more strict the screening and the less reads are allowed through.
+    Suggested values: 0 for very strict, 10000 for more leniency.  Default is 0.
+  
+-use_number_reads <num> (or -u <num>)
+    Limit the number of reads used to <num> pairs.  There can be an
+    excessive number of reads produced by the sequencer and reducing
+    the number used for assembly can make a better result.
+
+-outdir <dir> (-o <dir>)
+    Write results to specified directory.  Default is to use the cur-
+    rent directory.
+
+-workingdir <dir> (or -w <dir>)
+    Instead of using a temp directory put all intermediate files in
+    this directory.  Unlike the temp directory this one does not get
+    deleted after the script exits.
+
+-vector_end (or -v)
+    Include reads that contain some (but not all) vector.  Can be use-
+    ful in some finishing operations.  This option assumes that the
+    only thing in the screen fasta file is vector and E.coli (marked as
+    ecoli).
+
+-mapping <num> (-m <num>)
+    Set the minimum mapping score for the Smalt aligner.  Default is 45 and 0
+    is no minimum.
+
+-phusion (or -p)
+    Use phusion to screen out poor reads.  On by default but turning
+    off can be useful in some cases. Use -nophusion to turn off.
+
+-insert <num> (or -i <num>)
+    Set the insert size for SOAPdenovo.  Default is 300.
+    
+-trim <num> (or -t <num)
+    Set the read trim length.  Default is 72.
+
+-noisy
+
+    Both assemblers produce a great deal of output printed to the screen
+    while they are running and is normally hidden.  This option allows the
+    output.   
+
+
+Example
+-------
+
+In the test_data directory there are two fastq files, fSY3L3_1.fastq and
+fSY3L3_2.fastq, containing the reads we want to assembly and a file called
+ev.fasta that contains vector and ecoli sequences that we want to screen
+out.
+
+icas -fq1 fSY3L3_1.fastq -fq2 fSY3L3_2.fastq -s ev.fasta -c example
+
+This should produce three files example.contig.fasta, example.0.g5d and
+example.0.g5x.  The fasta file should contain a single contig of 41k bases.
+
+
+Changes from 0.6.1
+------------------
+
+Restructured assembly steps to make retrying faster.  Changed the reads
+that gets mapped back to the contig to an earlier, less filtered set. 
+
+
+Authors
+-------
+
+Installation scripts by German Tischler (gt1@sanger.ac.uk)
+
+icas by Zemin Ning (zn1@sanger.ac.uk) and Andrew Whitwham (aw7@sanger.ac.uk)
+
+
+
+Copyright (c) 2012, 2014 Genome Research Ltd.
+
+This file is part of iCAS.
+
+1. The usage of a range of years within a copyright statement contained within
+this distribution should be interpreted as being equivalent to a list of years
+including the first and last year specified and all consecutive years between
+them. For example, a copyright statement that reads 'Copyright (c) 2005, 2007-
+2009, 2011-2012' should be interpreted as being identical to a statement that
+reads 'Copyright (c) 2005, 2007, 2008, 2009, 2011, 2012' and a copyright
+statement that reads "Copyright (c) 2005-2012' should be interpreted as being
+identical to a statement that reads 'Copyright (c) 2005, 2006, 2007, 2008,
+2009, 2010, 2011, 2012'.
+
+
+
+
