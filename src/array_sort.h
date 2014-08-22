@@ -27,7 +27,7 @@
 #define _SANGER_ARRAY_SORT_H
 
 #define SWAP(a,b) temp=(a);(a)=b;(b)=temp;
-#define Max_N_NameBase 60
+#define Max_N_NameBase 100
 
 void ArraySort_Long(int n, long *arr);
 void ArraySort_Int(int n, int *arr);
