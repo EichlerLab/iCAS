@@ -32,8 +32,6 @@
 #include "matrix.h"
 #include "array_sort.h"
 
-#define Max_N_NameBase 60
-
 char **Read_Index(char *filename, int *ctg2wgs_index, fasta *seq, int nRead, int nSeq);
 
 int main(int argc, char **argv) {
